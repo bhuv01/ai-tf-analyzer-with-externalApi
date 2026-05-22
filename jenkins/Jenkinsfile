@@ -1,0 +1,189 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// Jenkinsfile — AI-Powered Terraform Plan Analyzer
+// Works with ANY Terraform project
+//
+// Flow: Checkout → TF Init → TF Plan → AI Analysis → Approval Gate → Apply
+// ═══════════════════════════════════════════════════════════════════════════
+
+pipeline {
+    agent any
+
+    environment {
+        // ── Read from Jenkins Credentials (never hardcode) ──────────────────
+        AWS_CREDENTIALS_ID   = 'aws-credentials'   // set in Jenkins → Credentials
+
+        // ── These are set from config.env via your team's Jenkins config ────
+        AWS_REGION           = 'ap-south-1'        // your region
+        LAMBDA_FUNCTION_NAME = 'tf-analyzer-dev-analyzer'  // from terraform output
+        TF_WORKING_DIR       = 'terraform'          // path to YOUR tf directory in repo
+    }
+
+    options {
+        timeout(time: 60, unit: 'MINUTES')
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+
+    parameters {
+        choice(name: 'TARGET_ENV', choices: ['dev', 'staging', 'prod'], description: 'Target environment')
+        booleanParam(name: 'SKIP_APPLY', defaultValue: true, description: 'Plan only, do not apply (safe mode)')
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.COMMIT_ID   = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                    env.GIT_BRANCH  = sh(script: 'git rev-parse --abbrev-ref HEAD', returnStdout: true).trim()
+                    env.GIT_AUTHOR  = sh(script: 'git log -1 --pretty=format:%an', returnStdout: true).trim()
+                    echo "Branch: ${env.GIT_BRANCH} | Commit: ${env.COMMIT_ID} | Author: ${env.GIT_AUTHOR}"
+                }
+            }
+        }
+
+        stage('Terraform Init') {
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: env.AWS_CREDENTIALS_ID
+                ]]) {
+                    dir(env.TF_WORKING_DIR) {
+                        sh 'terraform init -input=false && terraform validate'
+                    }
+                }
+            }
+        }
+
+        stage('Terraform Plan') {
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: env.AWS_CREDENTIALS_ID
+                ]]) {
+                    dir(env.TF_WORKING_DIR) {
+                        sh '''
+                            terraform plan -out=tfplan -input=false
+                            terraform show -json tfplan > plan.json
+                        '''
+                    }
+                }
+            }
+            post {
+                always { archiveArtifacts artifacts: "${env.TF_WORKING_DIR}/plan.json", allowEmptyArchive: true }
+            }
+        }
+
+stage('AI Risk Analysis') {
+    steps {
+        withCredentials([[
+            $class: 'AmazonWebServicesCredentialsBinding',
+            credentialsId: env.AWS_CREDENTIALS_ID
+        ]]) {
+            script {
+                def planJson = readFile("${env.TF_WORKING_DIR}/plan.json")
+
+                // Payload file seedha shell se banao — JsonSlurper avoid karo
+                writeFile file: 'payload.json', text: """{"plan_json": ${planJson}, "metadata": {"environment": "${params.TARGET_ENV}", "branch": "${env.GIT_BRANCH}", "commit_id": "${env.COMMIT_ID}", "triggered_by": "${env.GIT_AUTHOR}", "build_number": "${env.BUILD_NUMBER}"}}"""
+
+                sh '''
+                    aws lambda invoke \
+                        --function-name ${LAMBDA_FUNCTION_NAME} \
+                        --region ${AWS_REGION} \
+                        --payload fileb://payload.json \
+                        --cli-binary-format raw-in-base64-out \
+                        response.json
+                '''
+
+                // Response parse karo shell se — Groovy mein nahi
+                env.PIPELINE_ACTION  = sh(script: "cat response.json | python3 -c \"import sys,json; b=json.load(sys.stdin); print(json.loads(b['body'])['pipeline_action'])\"", returnStdout: true).trim()
+                env.PIPELINE_MESSAGE = sh(script: "cat response.json | python3 -c \"import sys,json; b=json.load(sys.stdin); print(json.loads(b['body'])['pipeline_message'])\"", returnStdout: true).trim()
+                env.OVERALL_RISK     = sh(script: "cat response.json | python3 -c \"import sys,json; b=json.load(sys.stdin); print(json.loads(b['body'])['analysis']['overall_risk'])\"", returnStdout: true).trim()
+                env.AI_REC           = sh(script: "cat response.json | python3 -c \"import sys,json; b=json.load(sys.stdin); print(json.loads(b['body'])['analysis']['approval_recommendation'])\"", returnStdout: true).trim()
+                env.AI_SUMMARY       = sh(script: "cat response.json | python3 -c \"import sys,json; b=json.load(sys.stdin); print(json.loads(b['body'])['analysis']['summary'])\"", returnStdout: true).trim()
+                env.ALERT_SENT       = sh(script: "cat response.json | python3 -c \"import sys,json; b=json.load(sys.stdin); print(json.loads(b['body'])['alert_sent'])\"", returnStdout: true).trim()
+
+                echo """
+╔══════════════════════════════════════════════════════════╗
+║  AI ANALYSIS RESULT                                      ║
+╠══════════════════════════════════════════════════════════╣
+║  Summary    : ${env.AI_SUMMARY}
+║  Risk       : ${env.OVERALL_RISK}
+║  Recommend  : ${env.AI_REC}
+║  Action     : ${env.PIPELINE_ACTION}
+║  Alert Sent : ${env.ALERT_SENT}
+╚══════════════════════════════════════════════════════════╝"""
+
+                if (env.PIPELINE_ACTION == 'FAIL') {
+                    error("❌ REJECTED: ${env.PIPELINE_MESSAGE}")
+                }
+                // TESTING ONLY — har build pe approval gate aayega
+                env.PIPELINE_ACTION = 'WAIT_APPROVAL'
+            }
+        }
+    }
+    post {
+        always { archiveArtifacts artifacts: 'response.json', allowEmptyArchive: true }
+    }
+}
+
+        stage('Manual Approval Gate') {
+            when { expression { env.PIPELINE_ACTION == 'WAIT_APPROVAL' } }
+            steps {
+                script {
+                    timeout(time: 24, unit: 'HOURS') {
+                        def decision = input(
+                            message: """⚠️ MANUAL APPROVAL REQUIRED
+
+Risk     : ${env.OVERALL_RISK}
+Summary  : ${env.AI_SUMMARY}
+Branch   : ${env.GIT_BRANCH}
+
+Check email for full security report. Approve or Reject?""",
+                            ok: 'APPROVE',
+                            parameters: [
+                                choice(name: 'DECISION', choices: ['APPROVE', 'REJECT']),
+                                string(name: 'NOTES', defaultValue: '', description: 'Reason (required for audit)')
+                            ]
+                        )
+                        env.HUMAN_DECISION = decision['DECISION']
+                        env.HUMAN_NOTES    = decision['NOTES']
+                        if (env.HUMAN_DECISION == 'REJECT') {
+                            error("❌ Rejected by reviewer: ${env.HUMAN_NOTES}")
+                        }
+                        echo "✅ Approved by: ${currentBuild.rawBuild.getCause(hudson.model.Cause.UserIdCause)?.userId}"
+                    }
+                }
+            }
+        }
+
+        stage('Terraform Apply') {
+            when {
+                allOf {
+                    expression { !params.SKIP_APPLY }
+                    anyOf {
+                        expression { env.PIPELINE_ACTION == 'PROCEED' }
+                        expression { env.HUMAN_DECISION == 'APPROVE' }
+                    }
+                }
+            }
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: env.AWS_CREDENTIALS_ID
+                ]]) {
+                    dir(env.TF_WORKING_DIR) {
+                        sh 'terraform apply -auto-approve -input=false tfplan'
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always  { sh 'rm -f payload.json || true' }
+        success { echo "✅ Pipeline done. Risk=${env.OVERALL_RISK ?: 'N/A'}" }
+        failure { echo "❌ Pipeline failed." }
+    }
+}
