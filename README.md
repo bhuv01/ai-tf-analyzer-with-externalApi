@@ -1,319 +1,591 @@
 # 🤖 AI-Powered Terraform Plan Analyzer
-### Works with ANY Terraform project • Jenkins • AWS Bedrock • Gmail Alerts • Manual Approval Gate
+### Works with ANY Terraform project • External AI API • Jenkins • Lambda/SNS optional • Manual Approval Gate
 
 ---
 
-## ⚡ Quick Start (3 Commands)
+## What This Project Does
+
+This project reviews a Terraform plan **before `terraform apply`**.
+
+It converts your Terraform plan into JSON, sends it to an **external OpenAI-compatible AI API**, receives a risk/security review, and then returns a pipeline decision:
+
+```text
+PROCEED        → Low risk, apply can continue
+WAIT_APPROVAL  → Medium/High risk, human approval required
+FAIL           → Critical risk, stop the pipeline
+```
+
+The setup is generic. You can change the model from variables only, and the output will show exactly which model was requested and which model the API reported.
+
+---
+
+## Current AI Provider
+
+This version uses an external AI API endpoint:
 
 ```bash
-# 1. Edit config.env — set your email and region
-vim config.env
+https://api.ai.kodekloud.com/v1
+```
 
-# 2. Run setup (validates everything, generates terraform.tfvars)
-./scripts/setup.sh
+The handler uses OpenAI-compatible chat completion format:
 
-# 3. Local test — no deployment needed
+```text
+POST /chat/completions
+Authorization: Bearer <EXTERNAL_API_KEY>
+```
+
+Example models:
+
+```bash
+claude-haiku-4-5-20251001
+moonshotai/kimi-k2.5
+```
+
+> Important: If you pasted an API key in chat, terminal, ticket, or Git, rotate/revoke it and use a new key.
+
+---
+
+## ⚡ Quick Start — Local Test Without AWS
+
+Use this when AWS keys are disabled or you only want to verify model/API output locally.
+
+```bash
+# 1. Export external AI config
+export AI_PROVIDER="external"
+export EXTERNAL_API_URL="https://api.ai.kodekloud.com/v1"
+export EXTERNAL_API_KEY="YOUR_NEW_ROTATED_API_KEY"
+export EXTERNAL_MODEL_ID="claude-haiku-4-5-20251001"
+
+# 2. Runtime settings
+export MAX_TOKENS="4096"
+export TEMPERATURE="0"
+export API_TIMEOUT_SECONDS="90"
+export ENVIRONMENT="dev"
+
+# 3. Disable AWS/SNS for local test
+export SNS_TOPIC_ARN=""
+export LOCAL_DEBUG="true"
+
+# 4. Run local test
 python3 tests/test_local.py
+```
+
+Expected output:
+
+```text
+================================================================================
+AI MODEL CALL STARTED
+================================================================================
+ai_provider             : external
+api_url                 : https://api.ai.kodekloud.com/v1
+model_requested         : claude-haiku-4-5-20251001
+max_tokens              : 4096
+temperature             : 0.0
+api_timeout_seconds     : 90
+external_api_key        : ***MASKED***
+================================================================================
+
+================================================================================
+AI MODEL CALL COMPLETED
+================================================================================
+ai_provider             : external
+api_status_code         : 200
+api_url                 : https://api.ai.kodekloud.com/v1
+model_requested         : claude-haiku-4-5-20251001
+model_reported_by_api   : claude-haiku-4-5-20251001
+overall_risk            : HIGH
+approval_recommendation : REVIEW
+================================================================================
 ```
 
 ---
 
 ## 🗺️ Architecture
 
-```
-Your Terraform Project (any project)
-         │
-         │  terraform plan → plan.json
-         ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    JENKINS PIPELINE                         │
-│                                                             │
-│  Checkout → TF Init → TF Plan → AI Analysis                 │
-│                                      │                      │
-│                          ┌───────────┼───────────┐          │
-│                          │           │           │          │
-│                       PROCEED  WAIT_APPROVAL   FAIL         │
-│                          │           │           │          │
-│                          │    📧 Email Alert     ❌ Stop    │
-│                          │    ⏸️ Jenkins Pauses             │
-│                          │    👤 Human Approves             │
-│                          │           │                      │
-│                          └─────TF Apply──────────┘          │
-└─────────────────────────────────────────────────────────────┘
-         │
-         ▼
-  AWS Bedrock (Claude)
-  → Summary + Security Findings + Risk Score + Recommendation
+```text
+Your Terraform Project
+        |
+        | terraform plan -out=tfplan
+        | terraform show -json tfplan > plan.json
+        v
+Local Test / Jenkins Pipeline
+        |
+        | payload.json
+        v
+handler.py
+        |
+        | EXTERNAL_API_URL
+        | EXTERNAL_API_KEY
+        | EXTERNAL_MODEL_ID
+        v
+External AI API
+        |
+        | JSON risk analysis
+        v
+Pipeline Decision
+        |
+        +--> PROCEED        → terraform apply
+        +--> WAIT_APPROVAL  → manual approval
+        +--> FAIL           → stop pipeline
+
+Optional AWS Deployment:
+        Lambda + SNS Email + CloudWatch Logs
 ```
 
 ---
 
 ## 📁 Project Structure
 
-```
+```text
 ai-tf-analyzer/
-│
-├── config.env                 ← ⭐ EDIT THIS FIRST — all settings here
-│
+|
+├── config.env
+│   └── Main config for setup.sh and terraform.tfvars generation
+|
 ├── lambda/
-│   ├── handler.py             ← AI analysis logic (Bedrock Claude)
-│   └── requirements.txt       ← Python deps (boto3 only)
-│
+│   ├── handler.py
+│   │   └── Main Terraform plan analyzer + external AI API call
+│   └── requirements.txt
+|
 ├── terraform/
-│   ├── main.tf                ← Lambda + IAM + SNS infrastructure
+│   ├── main.tf
+│   │   └── Optional AWS Lambda + SNS + CloudWatch deployment
 │   ├── variables.tf
 │   ├── outputs.tf
-│   └── terraform.tfvars       ← Auto-generated by setup.sh (gitignored)
-│
-├── jenkins/
-│   └── Jenkinsfile            ← Complete CI/CD pipeline
-│
+│   └── terraform.tfvars
+│       └── Generated from config.env, do not commit
+|
 ├── scripts/
-│   ├── setup.sh               ← One-time setup + validation
-│   ├── deploy.sh              ← Deploy to AWS (terraform apply)
-│   └── analyze.sh             ← Analyze any terraform project
-│
+│   ├── setup.sh
+│   ├── deploy.sh
+│   └── analyze.sh
+|
 ├── tests/
-│   ├── test_local.py          ← Local test (no deploy needed)
-│   └── sample_plan.json       ← Sample plan with security issues
-│
-└── docs/
-    └── jenkins-setup.md       ← Jenkins configuration guide
+│   ├── test_local.py
+│   └── sample_plan.json
+|
+└── jenkins/
+    └── Jenkinsfile
 ```
 
 ---
 
-## 🔧 Step-by-Step Setup
+## 🔧 Configuration
 
-### Step 1 — Edit config.env
+### `config.env`
 
-Open `config.env` and change these values:
+Use this for local setup and terraform variable generation.
 
 ```bash
-# Your AWS region
+# AWS settings — required only for Lambda/SNS deployment
 AWS_REGION=ap-south-1
+PROJECT_NAME=tf-analyzer
+ENVIRONMENT=dev
+ALERT_EMAIL=your-email@example.com
 
-# Bedrock model (choose based on your region):
-#   ap-south-1 / ap-southeast-1  →  apac.anthropic.claude-3-5-sonnet-20241022-v2:0
-#   us-east-1 / us-east-2        →  us.anthropic.claude-3-5-sonnet-20241022-v2:0
-#   eu-west-1 / eu-central-1     →  eu.anthropic.claude-3-5-sonnet-20241022-v2:0
-BEDROCK_MODEL_ID=apac.anthropic.claude-3-5-sonnet-20241022-v2:0
+# External AI settings
+AI_PROVIDER=external
+EXTERNAL_API_URL=https://api.ai.kodekloud.com/v1
+EXTERNAL_API_KEY=YOUR_NEW_ROTATED_API_KEY
+EXTERNAL_MODEL_ID=claude-haiku-4-5-20251001
 
-# Your Gmail or any email for HIGH risk alerts
-ALERT_EMAIL=your-email@gmail.com
+# Runtime settings
+MAX_TOKENS=4096
+TEMPERATURE=0
+API_TIMEOUT_SECONDS=90
+LOCAL_DEBUG=true
 
-# Your Terraform project path (for analyze.sh)
+# Terraform project path for analyze.sh
 YOUR_TF_DIR=../your-terraform-project
+
+# Lambda settings — required only for AWS deployment
+LAMBDA_TIMEOUT=120
+LAMBDA_MEMORY=256
+LOG_RETENTION_DAYS=14
 ```
 
-### Step 2 — Run Setup
+---
+
+## Changing Model
+
+Only change this value:
 
 ```bash
-./scripts/setup.sh
+export EXTERNAL_MODEL_ID="moonshotai/kimi-k2.5"
 ```
 
-This will:
-- Validate all prerequisites (aws cli, terraform, python3, boto3)
-- Check your AWS credentials
-- Verify Bedrock model access
-- Generate `terraform/terraform.tfvars` from `config.env`
-- Update `.gitignore`
+or in `terraform.tfvars`:
 
-### Step 3 — Test Locally
+```hcl
+external_model_id = "moonshotai/kimi-k2.5"
+```
+
+The output will show:
+
+```json
+{
+  "ai_call": {
+    "ai_provider": "external",
+    "api_url": "https://api.ai.kodekloud.com/v1",
+    "model_requested": "moonshotai/kimi-k2.5",
+    "model_reported_by_api": "moonshotai/kimi-k2.5",
+    "api_status_code": 200
+  }
+}
+```
+
+`model_requested` means the model sent in the API request.
+
+`model_reported_by_api` means the model returned by the API response. If the provider internally routes to a different model, this field helps you detect that.
+
+---
+
+## Local Test With Your Own Terraform Project
+
+Generate a Terraform JSON plan:
+
+```bash
+cd /path/to/your/terraform
+terraform init
+terraform plan -out=tfplan
+terraform show -json tfplan > plan.json
+```
+
+Run analyzer:
+
+```bash
+cd /path/to/ai-tf-analyzer
+python3 tests/test_local.py --plan /path/to/your/terraform/plan.json
+```
+
+If your `test_local.py` does not support `--plan`, use the sample test first:
 
 ```bash
 python3 tests/test_local.py
 ```
 
-Uses the sample plan in `tests/sample_plan.json`. No Lambda deployment needed — calls Bedrock directly.
+---
 
-To test with your own Terraform project:
-```bash
-# Generate plan JSON from your project
-cd /path/to/your/terraform
-terraform plan -out=tfplan
-terraform show -json tfplan > plan.json
+## Optional AWS Deployment
 
-# Analyze it
-cd /path/to/ai-tf-analyzer
-python3 tests/test_local.py --plan /path/to/your/terraform/plan.json
-```
-
-### Step 4 — Deploy to AWS
+Use this only when you want Lambda + SNS email + CloudWatch.
 
 ```bash
-# Preview what will be created
+./scripts/setup.sh
 ./scripts/deploy.sh plan
-
-# Deploy Lambda + SNS + IAM
 ./scripts/deploy.sh apply
 ```
 
-**What gets created (all free tier):**
-- Lambda function (`tf-analyzer-dev-analyzer`)
-- IAM role with least-privilege policies
-- SNS topic for email alerts
-- CloudWatch log group (7 day retention)
+This creates:
 
-### Step 5 — Confirm Email Subscription
-
-After `deploy.sh apply`, check your email.
-You will get: **"AWS Notification — Subscription Confirmation"**
-**Click the link** — otherwise alerts won't arrive.
-
-### Step 6 — Analyze Any Terraform Project
-
-```bash
-# Analyze a terraform directory directly
-./scripts/analyze.sh --tf-dir /path/to/your/terraform
-
-# Analyze an existing plan.json file
-./scripts/analyze.sh --plan-file /path/to/plan.json
-
-# Quick test with sample plan
-./scripts/analyze.sh --sample
-
-# Local mode (no Lambda, calls Bedrock directly)
-./scripts/analyze.sh --local --tf-dir /path/to/your/terraform
+```text
+Lambda Function
+IAM Role
+SNS Topic
+SNS Email Subscription
+CloudWatch Log Group
 ```
 
-### Step 7 — Setup Jenkins
+After deployment, confirm the SNS email subscription from your inbox.
 
-See `docs/jenkins-setup.md` for complete Jenkins configuration.
+---
 
-Key Jenkins settings:
-```groovy
-// In Jenkinsfile, update these two lines:
-AWS_REGION           = 'ap-south-1'              // your region
-LAMBDA_FUNCTION_NAME = 'tf-analyzer-dev-analyzer' // from terraform output
-TF_WORKING_DIR       = 'terraform'                // path to tf in your repo
+## Terraform Variables
+
+Your `terraform/variables.tf` should include:
+
+```hcl
+variable "ai_provider" {
+  type        = string
+  description = "AI provider name"
+  default     = "external"
+}
+
+variable "external_api_url" {
+  type        = string
+  description = "External AI API base URL"
+  default     = "https://api.ai.kodekloud.com/v1"
+}
+
+variable "external_api_key" {
+  type        = string
+  description = "External AI API key"
+  sensitive   = true
+}
+
+variable "external_model_id" {
+  type        = string
+  description = "External AI model ID"
+  default     = "claude-haiku-4-5-20251001"
+}
+
+variable "max_tokens" {
+  type        = number
+  description = "Max output tokens"
+  default     = 4096
+}
+
+variable "temperature" {
+  type        = number
+  description = "AI temperature"
+  default     = 0
+}
+
+variable "api_timeout_seconds" {
+  type        = number
+  description = "External API timeout seconds"
+  default     = 90
+}
+
+variable "local_debug" {
+  type        = bool
+  description = "Print debug logs showing provider/model"
+  default     = true
+}
+```
+
+---
+
+## Lambda Environment Variables
+
+Your `terraform/main.tf` Lambda environment should pass these values:
+
+```hcl
+environment {
+  variables = {
+    AWS_REGION  = var.aws_region
+    ENVIRONMENT = var.environment
+
+    AI_PROVIDER = var.ai_provider
+
+    EXTERNAL_API_URL  = var.external_api_url
+    EXTERNAL_API_KEY  = var.external_api_key
+    EXTERNAL_MODEL_ID = var.external_model_id
+
+    MAX_TOKENS          = tostring(var.max_tokens)
+    TEMPERATURE         = tostring(var.temperature)
+    API_TIMEOUT_SECONDS = tostring(var.api_timeout_seconds)
+
+    SNS_TOPIC_ARN = aws_sns_topic.alerts.arn
+    LOCAL_DEBUG   = tostring(var.local_debug)
+  }
+}
 ```
 
 ---
 
 ## 📊 What the AI Analyzes
 
-The analyzer checks every resource change against a 10-point security checklist:
+The analyzer checks Terraform changes for:
 
 | Check | What it looks for |
-|-------|------------------|
-| IAM | Overly broad permissions (`AdministratorAccess`, `*`) |
-| Network | Security groups open to `0.0.0.0/0` |
-| Data | Databases/storage being deleted |
+|------|-------------------|
+| IAM | AdministratorAccess, wildcard `*`, overly broad policies |
+| Network | `0.0.0.0/0` or `::/0` ingress on sensitive ports |
+| Data Loss | RDS, DB, volume, or bucket deletion |
 | Encryption | Encryption disabled or removed |
-| Availability | Resources being replaced (destroy + recreate) |
-| Backup | Backup/retention settings reduced to 0 |
-| Public Access | S3 buckets with public access enabled |
-| Deletion Protection | Missing on critical resources |
-| Cross-environment | Prod resources touched from non-prod branch |
-| Cost | Unexpected cost increases |
+| Availability | Resource replacement causing downtime |
+| Backup | Backup or retention reduced to unsafe values |
+| Public Access | Public S3 bucket, public ACL, public policy |
+| Deletion Protection | Missing deletion protection on critical resources |
+| Environment Safety | Prod resources changed from non-prod branch |
+| Cost | Large or unexpected cost-impact resources |
+| Secrets | Secrets in user data, tags, env vars, or plain text |
 
 ---
 
-## 📤 Pipeline Decision Logic
+## Pipeline Decision Logic
 
-```
+```text
 AI returns APPROVE + LOW risk
-  └── ✅ PROCEED → terraform apply runs automatically
+  -> PROCEED
+  -> terraform apply can run
 
-AI returns REVIEW + MEDIUM/HIGH risk
-  └── 📧 Email sent to your Gmail
-      ⏸️ Jenkins PAUSES (waits up to 24 hours)
-      👤 DevOps lead logs in → APPROVE or REJECT
-      ✅ APPROVE → terraform apply
-      ❌ REJECT  → build fails with audit note
+AI returns REVIEW or HIGH/CRITICAL risk
+  -> WAIT_APPROVAL
+  -> Jenkins/manual approval required
 
-AI returns REJECT + CRITICAL risk
-  └── ❌ Build FAILS immediately (no apply)
-      📧 Email still sent for awareness
+AI returns REJECT
+  -> FAIL
+  -> pipeline stops immediately
 ```
 
 ---
 
-## 📧 Sample Alert Email
+## Sample Output
 
-```
-══════════════════════════════════════════════════════════════
-  TERRAFORM PLAN ALERT  🔴 HIGH RISK  ⚠️ REVIEW
-══════════════════════════════════════════════════════════════
-
-PIPELINE INFO
-  Environment  : DEV
-  Branch       : feature/migrate-infra
-  Commit       : abc123
-  Triggered by : jenkins
-
-ANALYSIS
-  Summary    : Creates IAM admin role + deletes prod RDS
-  Risk Level : HIGH
-  Recommend  : REVIEW
-  Rollback   : IMPOSSIBLE (RDS deletion)
-
-SECURITY FINDINGS (3 total)
-  🚨 [CRITICAL] IAM — aws_iam_role_policy_attachment.admin
-     Issue  : AdministratorAccess policy — full AWS account access
-     Action : Use least-privilege policy
-
-  🔴 [HIGH] Network — aws_security_group.web_sg
-     Issue  : SSH port 22 open to 0.0.0.0/0
-     Action : Restrict to VPN/bastion IP
-
-  🔴 [HIGH] Data — aws_rds_instance.legacy_db
-     Issue  : Production DB deletion with no backup retention
-     Action : Take manual snapshot before applying
-
-⚠️  ACTION REQUIRED: Manual approval needed in Jenkins.
-══════════════════════════════════════════════════════════════
+```json
+{
+  "pipeline_action": "WAIT_APPROVAL",
+  "pipeline_message": "Plan requires manual approval. Risk=HIGH.",
+  "ai_call": {
+    "ai_provider": "external",
+    "api_url": "https://api.ai.kodekloud.com/v1",
+    "model_requested": "moonshotai/kimi-k2.5",
+    "model_reported_by_api": "moonshotai/kimi-k2.5",
+    "api_status_code": 200,
+    "max_tokens": 4096,
+    "temperature": 0
+  },
+  "analysis": {
+    "summary": "Creates public S3 access and admin IAM policy; deletes RDS instance.",
+    "overall_risk": "HIGH",
+    "approval_recommendation": "REVIEW",
+    "requires_manual_approval": true
+  }
+}
 ```
 
 ---
 
-## 💰 Cost (Free Account Friendly)
+## Invalid JSON / Truncated Response Fix
 
-| Service | Free Tier | Estimated Usage | Cost |
-|---------|-----------|-----------------|------|
-| Lambda | 1M req/month | ~50 runs | **₹0** |
-| SNS Email | 1000 emails/month | ~10-20 alerts | **₹0** |
-| CloudWatch | 5GB/month | Minimal (7 days) | **₹0** |
-| **Bedrock Claude** | ❌ No free tier | ~$0.02/analysis | **~₹1.70 per run** |
-| **Total (50 runs)** | | | **< ₹100/month** |
+If you see this error:
 
-**Save cost:** Switch to Claude Haiku in `config.env`:
+```text
+AI returned invalid JSON
+Unterminated string starting at...
+```
+
+It usually means the model response was cut before JSON completed.
+
+Fix it using these steps:
+
+### 1. Increase max tokens
+
 ```bash
-BEDROCK_MODEL_ID=apac.anthropic.claude-3-haiku-20240307-v1:0
-# Cost drops to ~₹0.17 per analysis
+export MAX_TOKENS="4096"
+```
+
+If still failing:
+
+```bash
+export MAX_TOKENS="8192"
+```
+
+### 2. Keep temperature zero
+
+```bash
+export TEMPERATURE="0"
+```
+
+### 3. Reduce Terraform plan excerpt
+
+In `handler.py`, reduce:
+
+```python
+raw_plan_excerpt[:5000]
+```
+
+to:
+
+```python
+raw_plan_excerpt[:2500]
+```
+
+### 4. Keep JSON response compact
+
+Ask the model for:
+
+```text
+Return ONLY compact valid JSON.
+Keep every string short.
+Max 5 security findings.
+Max 5 risks.
+Complete the JSON fully.
+```
+
+### 5. Try another model
+
+Some models are weaker at strict JSON output. If one model fails frequently, test another model with the same prompt.
+
+---
+
+## Troubleshooting
+
+| Error | Meaning | Fix |
+|------|---------|-----|
+| `EXTERNAL_API_KEY is missing` | API key env var not set | Export `EXTERNAL_API_KEY` or set in `terraform.tfvars` |
+| `External API HTTP error 401` | Invalid/expired API key | Rotate key and update config |
+| `External API HTTP error 404` | Wrong endpoint/model | Check `EXTERNAL_API_URL` and `EXTERNAL_MODEL_ID` |
+| `AI response is incomplete/truncated` | Model output cut before JSON completed | Increase `MAX_TOKENS`, reduce prompt size |
+| `AI returned invalid JSON` | Model did not return strict JSON | Use compact JSON prompt, temperature 0 |
+| `SNS_TOPIC_ARN not set` | Local mode or SNS disabled | Safe to ignore in local test |
+| `No module named boto3` | Needed only for SNS/Lambda mode | `pip3 install boto3` |
+| Lambda timeout | External API slow or plan too large | Increase `lambda_timeout` and reduce plan excerpt |
+
+---
+
+## Security Notes
+
+For local testing, using environment variables is fine:
+
+```bash
+export EXTERNAL_API_KEY="..."
+```
+
+For production, avoid storing keys in:
+
+```text
+Git repo
+README
+config.env committed to Git
+terraform.tfvars committed to Git
+Lambda env if many users have Lambda read access
+```
+
+Production-grade option:
+
+```text
+AWS Secrets Manager
+        |
+Lambda IAM Role gets secretsmanager:GetSecretValue
+        |
+handler.py reads key at runtime
+```
+
+Minimum recommendation:
+
+```text
+- Keep terraform.tfvars gitignored
+- Rotate API keys periodically
+- Do not print API key in logs
+- Mask API key in local debug output
+- Give Jenkins only required permissions
 ```
 
 ---
 
-## 🔒 Security Features
+## Cost Notes
 
-- **IAM Least Privilege** — each permission scoped to exact resource ARN
-- **No Hardcoded Secrets** — all credentials via Jenkins Credentials Manager
-- **Gitignored Sensitive Files** — `terraform.tfvars` never committed
-- **Audit Trail** — every run archives `plan.json` + `response.json` in Jenkins
-- **Approval Audit** — who approved, when, with what notes — all in Jenkins build log
+External API pricing depends on your API provider/model.
 
----
+This project itself can stay low-cost:
 
-## 🔁 Model Reference
+| Component | Local Mode | AWS Mode |
+|----------|------------|----------|
+| External AI API | Provider/model based | Provider/model based |
+| Lambda | Not used | Usually low/free-tier friendly |
+| SNS Email | Not used | Usually low/free-tier friendly |
+| CloudWatch | Not used | Small log cost |
 
-| Region | Model ID to use in config.env |
-|--------|-------------------------------|
-| ap-south-1, ap-southeast-1, ap-northeast-1 | `apac.anthropic.claude-3-5-sonnet-20241022-v2:0` |
-| us-east-1, us-east-2, us-west-2 | `us.anthropic.claude-3-5-sonnet-20241022-v2:0` |
-| eu-west-1, eu-central-1, eu-west-3 | `eu.anthropic.claude-3-5-sonnet-20241022-v2:0` |
-| Any region (cheaper) | Replace `sonnet` with `haiku` in above |
+For local testing with disabled AWS keys, only the external AI API is used.
 
 ---
 
-## 🆘 Troubleshooting
+## Final Flow
 
-| Error | Fix |
-|-------|-----|
-| `ValidationException: model identifier invalid` | Check BEDROCK_MODEL_ID prefix (apac./us./eu.) |
-| `AccessDeniedException` on Bedrock | Complete FTU form: Bedrock → Model catalog → Request access |
-| `SNS_TOPIC_ARN not set` | Run `./scripts/deploy.sh apply` first, or set env variable manually |
-| `No module named boto3` | Run `pip3 install boto3` |
-| Email not arriving | Click confirmation link in first AWS email |
-| Lambda timeout | Increase `LAMBDA_TIMEOUT=180` in `config.env`, re-run `setup.sh` + `deploy.sh apply` |
+```text
+terraform plan
+   |
+terraform show -json
+   |
+handler.py
+   |
+External AI API using EXTERNAL_MODEL_ID
+   |
+JSON risk analysis
+   |
+PROCEED / WAIT_APPROVAL / FAIL
+```
+
